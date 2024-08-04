@@ -1,21 +1,23 @@
-var __defProp = Object.defineProperty;
-var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
-
-// src/index.ts
 import { Soundcloud } from "soundcloud.ts";
 import { DisTubeError, ExtractorPlugin, Playlist, Song, checkInvalidKey } from "distube";
-var isTruthy = /* @__PURE__ */ __name((x) => Boolean(x), "isTruthy");
-var SearchType = /* @__PURE__ */ ((SearchType2) => {
-  SearchType2["Track"] = "track";
-  SearchType2["Playlist"] = "playlist";
-  return SearchType2;
-})(SearchType || {});
-var SoundCloudPlugin = class extends ExtractorPlugin {
-  static {
-    __name(this, "SoundCloudPlugin");
-  }
-  soundcloud;
-  constructor(options = {}) {
+import type { ResolveOptions } from "distube";
+import type { SoundcloudPlaylistV2, SoundcloudTrackV2 } from "soundcloud.ts";
+
+type Falsy = undefined | null | false | 0 | "";
+const isTruthy = <T>(x: T | Falsy): x is T => Boolean(x);
+export enum SearchType {
+  Track = "track",
+  Playlist = "playlist",
+}
+
+export interface SoundCloudPluginOptions {
+  clientId?: string;
+  oauthToken?: string;
+}
+
+export class SoundCloudPlugin extends ExtractorPlugin {
+  soundcloud: Soundcloud;
+  constructor(options: SoundCloudPluginOptions = {}) {
     super();
     if (typeof options !== "object" || Array.isArray(options)) {
       throw new DisTubeError("INVALID_TYPE", ["object", "undefined"], options, "SoundCloudPluginOptions");
@@ -29,10 +31,23 @@ var SoundCloudPlugin = class extends ExtractorPlugin {
     }
     this.soundcloud = new Soundcloud({
       clientId: options.clientId,
-      oauthToken: options.oauthToken
+      oauthToken: options.oauthToken,
     });
   }
-  async search(query, type = "track" /* Track */, limit = 10, options = {}) {
+  search<T>(query: string, type?: SearchType.Track, limit?: number, options?: ResolveOptions<T>): Promise<Song<T>[]>;
+  search<T>(
+    query: string,
+    type: SearchType.Playlist,
+    limit?: number,
+    options?: ResolveOptions<T>,
+  ): Promise<Playlist<T>[]>;
+  search<T>(
+    query: string,
+    type?: SearchType,
+    limit?: number,
+    options?: ResolveOptions<T>,
+  ): Promise<Song<T>[] | Playlist<T>[]>;
+  async search<T>(query: string, type: SearchType = SearchType.Track, limit = 10, options: ResolveOptions<T> = {}) {
     if (typeof query !== "string") {
       throw new DisTubeError("INVALID_TYPE", "string", query, "query");
     }
@@ -45,45 +60,70 @@ var SoundCloudPlugin = class extends ExtractorPlugin {
     if (typeof options !== "object" || Array.isArray(options)) {
       throw new DisTubeError("INVALID_TYPE", "object", options, "ResolveOptions");
     }
-    const data = await (type === "track" ? this.searchTracks(query, limit) : this.searchPlaylists(query, limit));
-    return data.map((t) => new (type === "track" ? SoundCloudSong : SoundCloudPlaylist)(this, t, options));
-  }
-  async searchTracks(query, limit) {
-    const data = await this.soundcloud.tracks.searchV2({ q: query, limit });
-    if (!data?.collection?.length) {
-      throw new DisTubeError("SOUNDCLOUD_PLUGIN_NO_RESULT", `Cannot find any "${query}" ${type} on SoundCloud!`);
+
+    await this.soundcloud.api.getClientId().catch(() => {
+      throw new DisTubeError(
+        "SOUNDCLOUD_PLUGIN_NO_CLIENT_ID",
+        "Cannot find SoundCloud client id automatically. Please provide a client id in the constructor.\nGuide: https://github.com/distubejs/soundcloud#documentation",
+      );
+    });
+
+    switch (type) {
+      case SearchType.Track: {
+        const data = await this.soundcloud.tracks.searchV2({ q: query, limit });
+        if (!data?.collection?.length) {
+          throw new DisTubeError("SOUNDCLOUD_PLUGIN_NO_RESULT", `Cannot find any "${query}" ${type} on SoundCloud!`);
+        }
+        return data.collection.map(t => new SoundCloudSong(this, t, options));
+      }
+      case SearchType.Playlist: {
+        const data = await this.soundcloud.playlists.searchV2({ q: query, limit });
+        const playlists = data.collection;
+        return (
+          await Promise.all(
+            playlists.map(async p => new SoundCloudPlaylist(this, await this.soundcloud.playlists.fetch(p), options)),
+          )
+        ).filter(isTruthy);
+      }
+      default:
+        throw new DisTubeError("SOUNDCLOUD_PLUGIN_UNSUPPORTED_TYPE", `${type} search is not supported!`);
     }
-    return data.collection;
   }
-  async searchPlaylists(query, limit) {
-    const data = await this.soundcloud.playlists.searchV2({ q: query, limit });
-    const playlists = data.collection;
-    return (await Promise.all(playlists.map((p) => this.soundcloud.playlists.fetch(p)))).filter(isTruthy);
-  }
-  validate(url) {
+
+  validate(url: string) {
     return /^https?:\/\/(?:(?:www|m)\.)?soundcloud\.com\/(.*)$/.test(url);
   }
-  async resolve(url, options) {
+
+  async resolve<T>(url: string, options: ResolveOptions<T>) {
+    await this.soundcloud.api.getClientId().catch(() => {
+      throw new DisTubeError(
+        "SOUNDCLOUD_PLUGIN_NO_CLIENT_ID",
+        "Cannot find SoundCloud client id automatically. Please provide a client id in the constructor.\nGuide: https://github.com/distubejs/soundcloud#documentation",
+      );
+    });
     const opt = { ...options, source: "soundcloud" };
     url = url.replace(/:\/\/(m|www)\./g, "://");
-    const data = await this.soundcloud.resolve.getV2(url, true).catch((e) => {
+    const data = await this.soundcloud.resolve.getV2(url, true).catch(e => {
       throw new DisTubeError("SOUNDCLOUD_PLUGIN_RESOLVE_ERROR", e.message);
     });
     if (!data || !["track", "playlist"].includes(data.kind)) {
       throw new DisTubeError("SOUNDCLOUD_PLUGIN_NOT_SUPPORTED", "Only public tracks and playlists are supported.");
     }
+
     return data.kind === "playlist"
       ? new SoundCloudPlaylist(this, await this.soundcloud.playlists.fetch(data), opt)
       : new SoundCloudSong(this, data, opt);
   }
-  async getRelatedSongs(song) {
+
+  async getRelatedSongs(song: SoundCloudSong<undefined>) {
     if (!song.url) {
       throw new DisTubeError("SOUNDCLOUD_PLUGIN_INVALID_SONG", "Cannot get related songs from invalid song.");
     }
     const related = await this.soundcloud.tracks.relatedV2(song.url, 10);
-    return related.filter((t) => t.title).map((t) => new SoundCloudSong(this, t));
+    return related.filter(t => t.title).map(t => new SoundCloudSong(this, t));
   }
-  async getStreamURL(song) {
+
+  async getStreamURL<T>(song: SoundCloudSong<T>) {
     if (!song.url) {
       throw new DisTubeError("SOUNDCLOUD_PLUGIN_INVALID_SONG", "Cannot get stream url from invalid song.");
     }
@@ -91,21 +131,20 @@ var SoundCloudPlugin = class extends ExtractorPlugin {
     if (!stream) {
       throw new DisTubeError(
         "SOUNDCLOUD_PLUGIN_RATE_LIMITED",
-        "Reached SoundCloud rate limits\nSee more: https://developers.soundcloud.com/docs/api/rate-limits#play-requests"
+        "Reached SoundCloud rate limits\nSee more: https://developers.soundcloud.com/docs/api/rate-limits#play-requests",
       );
     }
     return stream;
   }
-  async searchSong(query, options) {
-    const songs = await this.search(query, "track" /* Track */, 1, options);
+
+  async searchSong<T>(query: string, options: ResolveOptions<T>) {
+    const songs = await this.search(query, SearchType.Track, 1, options);
     return songs[0];
   }
-};
-var SoundCloudSong = class extends Song {
-  static {
-    __name(this, "SoundCloudSong");
-  }
-  constructor(plugin, info, options = {}) {
+}
+
+class SoundCloudSong<T> extends Song<T> {
+  constructor(plugin: SoundCloudPlugin, info: SoundcloudTrackV2, options: ResolveOptions<T> = {}) {
     super(
       {
         plugin,
@@ -115,40 +154,34 @@ var SoundCloudSong = class extends Song {
         name: info.title,
         url: info.permalink_url,
         thumbnail: info.artwork_url,
-        duration: info.duration / 1e3,
+        duration: info.duration / 1000,
         views: info.playback_count,
         uploader: {
           name: info.user?.username,
-          url: info.user?.permalink_url
+          url: info.user?.permalink_url,
         },
         likes: info.likes_count,
-        reposts: info.reposts_count
+        reposts: info.reposts_count,
       },
-      options
+      options,
     );
   }
-};
-var SoundCloudPlaylist = class extends Playlist {
-  static {
-    __name(this, "SoundCloudPlaylist");
-  }
-  constructor(plugin, info, options = {}) {
+}
+
+class SoundCloudPlaylist<T> extends Playlist<T> {
+  constructor(plugin: SoundCloudPlugin, info: SoundcloudPlaylistV2, options: ResolveOptions<T> = {}) {
     super(
       {
         source: "soundcloud",
         id: info.id.toString(),
         name: info.title,
         url: info.permalink_url,
-        thumbnail: info.artwork_url ?? void 0,
-        songs: info.tracks.map((s) => new SoundCloudSong(plugin, s, options))
+        thumbnail: info.artwork_url ?? undefined,
+        songs: info.tracks.map(s => new SoundCloudSong(plugin, s, options)),
       },
-      options
+      options,
     );
   }
-};
-var src_default = SoundCloudPlugin;
-export {
-  SearchType,
-  SoundCloudPlugin,
-  src_default as default
-};
+}
+
+export default SoundCloudPlugin;
